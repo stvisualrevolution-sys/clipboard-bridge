@@ -156,6 +156,34 @@ def _win_backend():
 
 clip_get, clip_set, BACKEND = _make_backend()
 
+# ---------------------------------------------------------------------------
+# 受信時の自動ペースト（任意・Windows のみ）。
+#   POST /clip でテキストを受け取り、クリップボードへ入れた直後に、
+#   今フォーカスのあるウィンドウへ Ctrl+V を送って自動で貼り付ける。
+#   ・既定 OFF（誤爆防止）。Web UI のチェック、または起動時 --paste で ON。
+#   ・既存のクリップボード共有は一切変えない（後方互換・追加機能）。
+# ---------------------------------------------------------------------------
+AUTO_PASTE = {"on": False}
+
+def _win_paste():
+    """Windows: 今フォーカスのある入力欄へ Ctrl+V を送る（標準ライブラリ ctypes のみ）。"""
+    try:
+        import ctypes, time as _t
+        _t.sleep(0.12)  # 直前の応答・フォーカス安定を待つ
+        u = ctypes.windll.user32
+        VK_CONTROL, VK_V, KEYUP = 0x11, 0x56, 0x0002
+        u.keybd_event(VK_CONTROL, 0, 0, 0)       # Ctrl ↓
+        u.keybd_event(VK_V, 0, 0, 0)             # V ↓
+        u.keybd_event(VK_V, 0, KEYUP, 0)         # V ↑
+        u.keybd_event(VK_CONTROL, 0, KEYUP, 0)   # Ctrl ↑
+    except Exception as e:
+        print("[autopaste] 失敗:", e)
+
+def maybe_autopaste():
+    """設定が ON かつ Windows のときだけ、別スレッドで自動ペーストする。"""
+    if AUTO_PASTE["on"] and sys.platform == "win32":
+        threading.Thread(target=_win_paste, daemon=True).start()
+
 
 # ---------------------------------------------------------------------------
 # Hub: 最新クリップボード状態の保持と SSE 配信
@@ -312,6 +340,9 @@ PAGE = """<!DOCTYPE html>
     <h1>Clipboard Bridge</h1>
     <div class="status"><span id="dot" class="dot"></span><span id="stat">接続中…</span></div>
   </header>
+  <div style="text-align:center;margin:6px 0 2px;font-size:13px;color:var(--fg)">
+    <label><input type="checkbox" id="ap" onchange="toggleAP()"> 受信したら自動で貼り付け（Windowsのみ）</label>
+  </div>
 
   <div class="card">
     <div class="label">PC のクリップボード <span id="origin" class="tag">PC</span></div>
@@ -402,6 +433,12 @@ function connect(){
   es.onerror = ()=>{ setStatus(false); es.close(); setTimeout(connect, 2000); };
 }
 connect();
+// 自動貼り付けトグル
+function toggleAP(){
+  fetch("/autopaste?on="+(document.getElementById("ap").checked?1:0))
+    .then(r=>r.json()).then(d=>{ if(!d.supported){ toast("自動貼り付けは Windows のみ対応です"); document.getElementById("ap").checked=false; } });
+}
+fetch("/autopaste").then(r=>r.json()).then(d=>{ var ap=document.getElementById("ap"); if(ap) ap.checked=!!d.auto_paste; }).catch(function(){});
 // 経過時間を定期更新
 setInterval(()=>{ const ts=+$("ts").dataset.ts; if(ts) $("ts").textContent="更新: "+relTime(ts); }, 10000);
 </script>
@@ -454,6 +491,14 @@ class Handler(BaseHTTPRequestHandler):
             self._sse()
         elif path == "/health":
             self._send(200, json.dumps({"ok": True, "backend": BACKEND}))
+        elif path == "/autopaste":
+            q = self.path.split("?", 1)[1] if "?" in self.path else ""
+            if "on=1" in q:
+                AUTO_PASTE["on"] = True
+            elif "on=0" in q:
+                AUTO_PASTE["on"] = False
+            self._send(200, json.dumps({"auto_paste": AUTO_PASTE["on"],
+                                        "supported": sys.platform == "win32"}))
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         else:
@@ -479,6 +524,7 @@ class Handler(BaseHTTPRequestHandler):
         if text is None:
             text = body.decode("utf-8", "replace")
         hub.push_from_remote(text, clip_set)
+        maybe_autopaste()
         self._send(200, json.dumps({"ok": True}))
 
     def _sse(self):
@@ -538,6 +584,10 @@ def print_qr(url):
 
 
 def main():
+    # 起動時に --paste / --auto-paste を付けると自動貼り付けを ON で開始（誤爆防止で既定 OFF）。
+    if "--paste" in sys.argv or "--auto-paste" in sys.argv:
+        AUTO_PASTE["on"] = True
+
     ip = get_lan_ip()
     url = "http://%s:%d" % (ip, PORT)
 
@@ -556,6 +606,9 @@ def main():
     print("      \033[1;36m%s\033[0m\n" % url)
     print("  （PC とこの iPhone を同じ Wi-Fi につないでください）")
     print("  クリップボード backend: %s" % BACKEND)
+    if sys.platform == "win32":
+        print("  自動貼り付け: %s（Webの『受信したら自動で貼り付け』で切替）"
+              % ("ON" if AUTO_PASTE["on"] else "OFF"))
     print(line)
     print_qr(url)
     print("  停止するには Ctrl+C\n")
