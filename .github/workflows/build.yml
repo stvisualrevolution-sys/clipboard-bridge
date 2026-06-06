@@ -1,0 +1,55 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build single-file exe
+        run: pyinstaller --onefile --console --name ClipboardBridge clipboard_bridge.py
+
+      - name: Upload artifact (every build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipboardBridge-windows
+          path: dist/ClipboardBridge.exe
+
+      - name: Publish Release (on version tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ClipboardBridge.exe
+          body: |
+            ## Clipboard Bridge — iPhone ⇄ Windows クリップボード共有
+
+            ### 使い方
+            1. 下の **ClipboardBridge.exe** をダウンロード
+            2. ダブルクリックで起動（※下の注意参照）
+            3. 黒い画面に出る `http://192.168.x.x:8765` を iPhone の Safari で開く
+            4. 「ホーム画面に追加」すればアプリのように使えます
+
+            PC と iPhone は**同じ Wi-Fi** につないでください。
+            背面タップでの送受信設定など詳細は README を参照。
+
+            ### ⚠️ 初回起動時の注意
+            - 「Windows によって PC が保護されました」と出たら
+              **「詳細情報」→「実行」** を押してください（署名なしアプリのため出ますが安全です）。
+            - 初回は Windows ファイアウォールが許可を聞いてきます。
+              **「プライベート ネットワーク」を許可**してください。
