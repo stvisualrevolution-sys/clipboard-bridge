@@ -186,6 +186,47 @@ def maybe_autopaste():
 
 
 # ---------------------------------------------------------------------------
+# 「自動・連続診察」のリモート操作（PC の「次の患者へ」ボタン ↔ iPhone）。
+#   ・PC が POST /next を押すたびに next_seq を +1。
+#   ・iPhone は録音中だけ GET /next-signal をポーリングし、next_seq の増加を検知したら
+#     自動で「停止 → 文字起こし → 整形 → PC へ送信 → 次の録音開始」を行う。
+#   ・iPhone は POST /status で自身の状態（録音中/処理中/送信済み件数）を報告し、
+#     PC の画面に「手応え」を表示する。
+#   既存のクリップボード共有には一切影響しない追加機能（後方互換）。
+# ---------------------------------------------------------------------------
+REMOTE_LOCK = threading.Lock()
+REMOTE = {
+    "next_seq": 0,      # PC が「次の患者へ」を押した回数（iPhone が増加を検知）
+    "state": "idle",    # iPhone の状態: recording / processing / sent / idle
+    "count": 0,         # 送信済み件数
+    "ts": 0.0,          # iPhone が最後に状態報告した時刻（age 計算用）
+}
+
+def remote_bump_next():
+    with REMOTE_LOCK:
+        REMOTE["next_seq"] += 1
+        return REMOTE["next_seq"]
+
+def remote_next_seq():
+    with REMOTE_LOCK:
+        return REMOTE["next_seq"]
+
+def remote_set_status(state, count):
+    with REMOTE_LOCK:
+        if state is not None:
+            REMOTE["state"] = state
+        if count is not None:
+            REMOTE["count"] = count
+        REMOTE["ts"] = time.time()
+
+def remote_status():
+    with REMOTE_LOCK:
+        age = (time.time() - REMOTE["ts"]) if REMOTE["ts"] else None
+        return {"state": REMOTE["state"], "count": REMOTE["count"],
+                "next_seq": REMOTE["next_seq"], "age": age}
+
+
+# ---------------------------------------------------------------------------
 # Hub: 最新クリップボード状態の保持と SSE 配信
 # ---------------------------------------------------------------------------
 
@@ -324,6 +365,8 @@ PAGE = """<!DOCTYPE html>
   button:active{ transform:scale(.97); }
   .primary{ background:linear-gradient(135deg,var(--accent),var(--accent2)); box-shadow:0 8px 20px #5b8cff44; }
   .ghost{ background:#222b45; color:var(--fg); border:1px solid var(--line); }
+  .stop{ background:linear-gradient(135deg,#ff7a59,#ff5b6e); box-shadow:0 8px 20px #ff5b6e55; font-size:18px; padding:18px; }
+  .statepill{ margin-left:auto; }
   .ts{ font-size:11px; color:var(--mut); margin-top:8px; }
   .hint{ font-size:12px; color:var(--mut); text-align:center; padding:6px 0 2px; line-height:1.6; }
   .toast{ position:fixed; left:50%; bottom:calc(26px + env(safe-area-inset-bottom));
@@ -342,6 +385,15 @@ PAGE = """<!DOCTYPE html>
   </header>
   <div style="text-align:center;margin:6px 0 2px;font-size:13px;color:var(--fg)">
     <label><input type="checkbox" id="ap" onchange="toggleAP()"> 受信したら自動で貼り付け（Windowsのみ）</label>
+  </div>
+
+  <div class="card consult">
+    <div class="label">診察コントロール（自動・連続）
+      <span id="iphoneState" class="tag statepill">iPhone: 未接続</span></div>
+    <div class="row">
+      <button class="stop" onclick="nextPatient()">⏹ 次の患者へ（停止して送信）</button>
+    </div>
+    <div class="ts" id="consultHint">iPhone で「自動・連続（PC直送）」を開始すると、ここで停止＝次の患者へ進めます。SOAP は下の枠に出ます。</div>
   </div>
 
   <div class="card">
@@ -441,6 +493,29 @@ function toggleAP(){
 fetch("/autopaste").then(r=>r.json()).then(d=>{ var ap=document.getElementById("ap"); if(ap) ap.checked=!!d.auto_paste; }).catch(function(){});
 // 経過時間を定期更新
 setInterval(()=>{ const ts=+$("ts").dataset.ts; if(ts) $("ts").textContent="更新: "+relTime(ts); }, 10000);
+
+// ---- 自動・連続診察: 「次の患者へ」ボタン & iPhone 状態表示 ----
+async function nextPatient(){
+  try{
+    const r = await fetch("/next", {method:"POST"});
+    if(!r.ok) throw 0;
+    toast("iPhone に『次の患者へ』を送りました");
+  }catch(e){ toast("送信に失敗しました（同じWi-Fiか確認）"); }
+}
+const STMAP = {recording:"●録音中", processing:"⏳整形・送信中", sent:"✓送信済み", idle:"待機中"};
+async function pollStatus(){
+  try{
+    const r = await fetch("/status");
+    const d = await r.json();
+    const el = $("iphoneState"); if(!el) return;
+    const fresh = (d.age != null && d.age < 60);  // 端末LLMの整形に時間がかかっても「未接続」に化けないよう余裕を持たせる
+    let label = fresh ? (STMAP[d.state] || d.state) : "未接続";
+    if(d.count) label += " ・ " + d.count + "件";
+    el.textContent = "iPhone: " + label;
+  }catch(e){}
+}
+setInterval(pollStatus, 1200);
+pollStatus();
 </script>
 </body>
 </html>
@@ -499,6 +574,12 @@ class Handler(BaseHTTPRequestHandler):
                 AUTO_PASTE["on"] = False
             self._send(200, json.dumps({"auto_paste": AUTO_PASTE["on"],
                                         "supported": sys.platform == "win32"}))
+        elif path == "/next-signal":
+            # iPhone が録音中にポーリングする。現在の next_seq を返す。
+            self._send(200, json.dumps({"seq": remote_next_seq()}))
+        elif path == "/status":
+            # PC の Web UI が iPhone の状態表示のためにポーリングする。
+            self._send(200, json.dumps(remote_status(), ensure_ascii=False))
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         else:
@@ -506,6 +587,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+
+        # PC の「次の患者へ」ボタン: next_seq を +1 して返す（iPhone が増加を検知）。
+        if path == "/next":
+            self._send(200, json.dumps({"seq": remote_bump_next()}))
+            return
+
+        # iPhone からの状態報告: {"state": "...", "count": N}。
+        if path == "/status":
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(length) if 0 < length <= MAX_BODY else b""
+            state, count = None, None
+            try:
+                d = json.loads(body.decode("utf-8"))
+                state = d.get("state")
+                count = d.get("count")
+            except Exception:
+                pass
+            remote_set_status(state, count)
+            self._send(200, json.dumps({"ok": True}))
+            return
+
         if path != "/clip":
             self._send(404, json.dumps({"error": "not found"}))
             return
